@@ -247,6 +247,9 @@ def extract_video_from_api(page, found_data):
                 if "aweme_detail" in json_data:
                     detail = json_data["aweme_detail"]
                     # Only process video pages (has "video" key with bit_rate), not note pages
+                    # Skip if we already have the data (handler can fire multiple times)
+                    if found_data.get("url"):
+                        return
                     if detail and "video" in detail and "bit_rate" in detail.get("video", {}):
                         # Extract metadata
                         found_data["metadata"] = extract_metadata(detail)
@@ -258,9 +261,9 @@ def extract_video_from_api(page, found_data):
                         cover_url = cover_urls[0] if cover_urls else ""
 
                         # Find best quality
+
+
                         bit_rate_list = video_info.get("bit_rate", [])
-                        if bit_rate_list:
-                            print(f"\n[Video] Found {len(bit_rate_list)} quality options.")
 
                         best_url = None
                         best_resolution = 0
@@ -270,9 +273,7 @@ def extract_video_from_api(page, found_data):
 
                         for br in bit_rate_list:
                             fmt = br.get("format", "")
-                            is_h265 = br.get("is_h265", 0)
                             current_br = br.get("bit_rate", 0)
-                            gear = br.get("gear_name", "unknown")
 
                             br_play_addr = br.get("play_addr", {})
                             br_url_list = br_play_addr.get("url_list", [])
@@ -281,33 +282,23 @@ def extract_video_from_api(page, found_data):
                             height = br_play_addr.get("height", 0)
                             resolution = width * height
 
-                            codec = "H265" if is_h265 else "H264"
-                            print(f" - {gear} ({width}x{height}) | {fmt} | {codec} | Bitrate: {current_br}")
-
                             # Only select mp4 format (muxed video+audio)
-                            if fmt != "mp4":
-                                continue
-
-                            if width == 0:
+                            if fmt != "mp4" or width == 0:
                                 continue
 
                             # Priority: higher resolution, then higher bitrate
-                            is_better = False
-                            if resolution > best_resolution:
-                                is_better = True
-                            elif resolution == best_resolution and current_br > best_bitrate:
-                                is_better = True
-
-                            if is_better and br_url_list:
-                                best_resolution = resolution
-                                best_bitrate = current_br
-                                selected = _select_best_url(br_url_list, "douyinvod.com")
-                                best_url = selected
-                                best_width = width
-                                best_height = height
+                            if resolution > best_resolution or (
+                                resolution == best_resolution and current_br > best_bitrate
+                            ):
+                                if br_url_list:
+                                    best_resolution = resolution
+                                    best_bitrate = current_br
+                                    best_url = _select_best_url(br_url_list, "douyinvod.com")
+                                    best_width = width
+                                    best_height = height
 
                         if best_url:
-                            print(f"\nSelected: {best_width}x{best_height} | Bitrate: {best_bitrate} | Format: mp4")
+                            print(f"[Video] Selected: {best_width}x{best_height} mp4 ({best_bitrate//1000}kbps) from {len(bit_rate_list)} options")
                             found_data["url"] = best_url
                             found_data["type"] = "video"
                             found_data["cover_url"] = cover_url
@@ -319,10 +310,82 @@ def extract_video_from_api(page, found_data):
                                 found_data["url"] = url_list[0]
                                 found_data["type"] = "video"
                                 found_data["cover_url"] = cover_url
+
             except Exception as e:
                 print(f"  Error parsing API: {e}")
 
     return handle_response
+
+
+# ---------------------------------------------------------------------------
+# Browser Pool: Keeps a persistent Chromium instance across requests
+# ---------------------------------------------------------------------------
+
+class BrowserPool:
+    """Maintains a persistent browser instance to avoid cold-start per request."""
+    _playwright = None
+    _browser = None
+    _lock = None
+
+    @classmethod
+    def _get_lock(cls):
+        """Lazy-init a lock (avoids import-time threading dependency)."""
+        if cls._lock is None:
+            import threading
+            cls._lock = threading.Lock()
+        return cls._lock
+
+    @classmethod
+    def get_browser(cls):
+        """Return (playwright, browser), launching on first call."""
+        if cls._browser and cls._browser.is_connected():
+            return cls._playwright, cls._browser
+
+        with cls._get_lock():
+            # Double check inside lock
+            if cls._browser and cls._browser.is_connected():
+                return cls._playwright, cls._browser
+
+            from playwright.sync_api import sync_playwright
+            cls._playwright = sync_playwright().start()
+            cls._browser = cls._playwright.chromium.launch(headless=True)
+            print("[BrowserPool] Chromium launched.")
+            return cls._playwright, cls._browser
+
+    @classmethod
+    def shutdown(cls):
+        """Clean up browser and Playwright resources."""
+        with cls._get_lock():
+            if cls._browser:
+                try:
+                    cls._browser.close()
+                except Exception:
+                    pass
+                cls._browser = None
+            if cls._playwright:
+                try:
+                    cls._playwright.stop()
+                except Exception:
+                    pass
+                cls._playwright = None
+            print("[BrowserPool] Shut down.")
+
+
+# ---------------------------------------------------------------------------
+# Resource blocking: skip images, fonts, CSS, analytics to speed up loading
+# ---------------------------------------------------------------------------
+
+_BLOCKED_RESOURCE_TYPES = {"image", "font", "stylesheet", "media"}
+_BLOCKED_URL_KEYWORDS = ["analytics", "log-sdk", "sentry"]
+
+def _block_unnecessary(route, request):
+    """Abort requests for resources we don't need."""
+    if request.resource_type in _BLOCKED_RESOURCE_TYPES:
+        route.abort()
+    elif any(kw in request.url for kw in _BLOCKED_URL_KEYWORDS):
+        route.abort()
+    else:
+        route.continue_()
 
 
 def get_douyin_media(url):
@@ -347,143 +410,155 @@ def get_douyin_media(url):
         or None on failure.
     """
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright  # noqa: F401 – validates install
     except ImportError:
         print("Error: 'playwright' library is required.")
         print("Please install: pip install playwright && playwright install chromium")
         return None
 
     result = None
+    start_ts = time.time()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720}
-        )
-        page = context.new_page()
+    _, browser = BrowserPool.get_browser()
+    context = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport={"width": 1280, "height": 720}
+    )
+    page = context.new_page()
 
-        found_data = {"url": None, "type": None, "cover_url": None, "metadata": None}
+    # Block unnecessary resources to speed up page load
+    page.route("**/*", _block_unnecessary)
 
-        # Attach API response handler for video extraction
-        page.on("response", extract_video_from_api(page, found_data))
+    found_data = {"url": None, "type": None, "cover_url": None, "metadata": None}
 
-        try:
-            print(f"Navigating to {url}...")
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    # Attach API response handler for video extraction
+    page.on("response", extract_video_from_api(page, found_data))
 
-            # Wait and check for video extraction
-            time.sleep(3)
+    try:
+        print(f"Navigating to {url}...")
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # Determine content type from final URL
-            final_url = page.url
-            print(f"Final URL: {final_url}")
+        # Determine content type from final URL
+        final_url = page.url
+        print(f"Final URL: {final_url}")
 
-            if "/video/" in final_url:
-                # Video page - wait for API interception
-                max_retries = 15
-                for _ in range(max_retries):
+        if "/video/" in final_url:
+            # Video page - poll with Playwright-native waits to pump events
+            for _ in range(20):  # up to ~10s
+                if found_data["url"]:
+                    break
+                page.wait_for_timeout(500)
+
+            if not found_data["url"]:
+                # Scroll nudge to trigger lazy-loading, then wait a bit more
+                page.mouse.wheel(0, 200)
+                for _ in range(10):  # up to ~5s more
                     if found_data["url"]:
                         break
-                    page.mouse.wheel(0, 100)
-                    time.sleep(0.5)
+                    page.wait_for_timeout(500)
 
-                if found_data["url"]:
-                    meta = found_data.get("metadata") or {}
+            if found_data["url"]:
+                meta = found_data.get("metadata") or {}
+                result = {
+                    "title": meta.get("title", ""),
+                    "author": meta.get("author", ""),
+                    "author_id": meta.get("author_id", ""),
+                    "cover": meta.get("cover", ""),
+                    "type": "video",
+                    "items": [
+                        {
+                            "type": "video",
+                            "video_url": found_data["url"],
+                            "cover_url": found_data.get("cover_url", ""),
+                        }
+                    ],
+                }
+                print("Successfully extracted video URL.")
+            else:
+                print("Failed to extract video URL via API.")
+
+        elif "/note/" in final_url:
+            # Note/Image page - extract via API for complete content
+            print("\n[Note] Detected image/note page, extracting content...")
+
+            # Extract note ID from URL
+            note_match = re.search(r'/note/(\d+)', final_url)
+            if note_match:
+                note_id = note_match.group(1)
+
+                # Try API extraction first (more reliable for lazy-loaded content)
+                api_result = extract_note_from_api(page, note_id)
+
+                if api_result and api_result.get("items"):
+                    meta = api_result["metadata"]
+                    items = api_result["items"]
+                    # Determine top-level type
+                    content_type = "images"
                     result = {
                         "title": meta.get("title", ""),
                         "author": meta.get("author", ""),
                         "author_id": meta.get("author_id", ""),
                         "cover": meta.get("cover", ""),
-                        "type": "video",
-                        "items": [
-                            {
-                                "type": "video",
-                                "video_url": found_data["url"],
-                                "cover_url": found_data.get("cover_url", ""),
-                            }
-                        ],
+                        "type": content_type,
+                        "items": items,
                     }
-                    print("Successfully extracted video URL.")
+                    item_types = [it["type"] for it in items]
+                    animated_count = item_types.count("animated_image")
+                    image_count = item_types.count("image")
+                    print(f"Successfully extracted {animated_count} animated + {image_count} static images via API.")
                 else:
-                    print("Failed to extract video URL via API.")
+                    # Fallback to DOM extraction – wait for images to appear
+                    print("API extraction failed, falling back to DOM...")
+                    try:
+                        page.wait_for_selector('img[src*="douyinpic"], [style*="background-image"]', timeout=5000)
+                    except Exception:
+                        pass  # Proceed even if timeout
 
-            elif "/note/" in final_url:
-                # Note/Image page - extract via API for complete content
-                print("\n[Note] Detected image/note page, extracting content...")
+                    dom_images = extract_images_from_dom(page)
+                    dom_videos = extract_videos_from_dom(page)
 
-                # Extract note ID from URL
-                note_match = re.search(r'/note/(\d+)', final_url)
-                if note_match:
-                    note_id = note_match.group(1)
+                    items = []
+                    if dom_videos:
+                        # Pair videos with images if possible
+                        for i, vid_url in enumerate(dom_videos):
+                            item = {
+                                "type": "animated_image",
+                                "video_url": vid_url,
+                            }
+                            if i < len(dom_images):
+                                item["image_url"] = dom_images[i]
+                            items.append(item)
+                        # Remaining images (if more images than videos)
+                        for img_url in dom_images[len(dom_videos):]:
+                            items.append({"type": "image", "image_url": img_url})
+                    else:
+                        for img_url in dom_images:
+                            items.append({"type": "image", "image_url": img_url})
 
-                    # Try API extraction first (more reliable for lazy-loaded content)
-                    api_result = extract_note_from_api(page, note_id)
-
-                    if api_result and api_result.get("items"):
-                        meta = api_result["metadata"]
-                        items = api_result["items"]
-                        # Determine top-level type
-                        content_type = "images"
+                    if items:
                         result = {
-                            "title": meta.get("title", ""),
-                            "author": meta.get("author", ""),
-                            "author_id": meta.get("author_id", ""),
-                            "cover": meta.get("cover", ""),
-                            "type": content_type,
+                            "title": "",
+                            "author": "",
+                            "author_id": "",
+                            "cover": "",
+                            "type": "images",
                             "items": items,
                         }
-                        item_types = [it["type"] for it in items]
-                        animated_count = item_types.count("animated_image")
-                        image_count = item_types.count("image")
-                        print(f"Successfully extracted {animated_count} animated + {image_count} static images via API.")
+                        print(f"Successfully extracted {len(items)} items from DOM.")
                     else:
-                        # Fallback to DOM extraction
-                        print("API extraction failed, falling back to DOM...")
-                        time.sleep(2)
-                        dom_images = extract_images_from_dom(page)
-                        dom_videos = extract_videos_from_dom(page)
-
-                        items = []
-                        if dom_videos:
-                            # Pair videos with images if possible
-                            for i, vid_url in enumerate(dom_videos):
-                                item = {
-                                    "type": "animated_image",
-                                    "video_url": vid_url,
-                                }
-                                if i < len(dom_images):
-                                    item["image_url"] = dom_images[i]
-                                items.append(item)
-                            # Remaining images (if more images than videos)
-                            for img_url in dom_images[len(dom_videos):]:
-                                items.append({"type": "image", "image_url": img_url})
-                        else:
-                            for img_url in dom_images:
-                                items.append({"type": "image", "image_url": img_url})
-
-                        if items:
-                            result = {
-                                "title": "",
-                                "author": "",
-                                "author_id": "",
-                                "cover": "",
-                                "type": "images",
-                                "items": items,
-                            }
-                            print(f"Successfully extracted {len(items)} items from DOM.")
-                        else:
-                            print("Failed to extract content.")
-                else:
-                    print("Could not extract note ID from URL.")
-
+                        print("Failed to extract content.")
             else:
-                print(f"Unknown page type: {final_url}")
+                print("Could not extract note ID from URL.")
 
-        except Exception as e:
-            print(f"Error: {e}")
-        finally:
-            browser.close()
+        else:
+            print(f"Unknown page type: {final_url}")
+
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        context.close()  # Close only the context, keep browser alive
+        elapsed = time.time() - start_ts
+        print(f"[Perf] Request completed in {elapsed:.2f}s")
 
     return result
 
@@ -497,34 +572,37 @@ if __name__ == "__main__":
     print(f"Target: {target_url}")
     print("Extracting...")
 
-    result = get_douyin_media(target_url)
+    try:
+        result = get_douyin_media(target_url)
 
-    if result:
-        print("\n" + "=" * 50)
-        print(f"Title:  {result.get('title', '')}")
-        print(f"Author: {result.get('author', '')}")
-        print(f"Type:   {result.get('type', '')}")
-        print(f"Cover:  {result.get('cover', '')}")
-        print(f"Items ({len(result.get('items', []))}):\n")
-        for i, item in enumerate(result.get("items", [])):
-            item_type = item["type"]
-            if item_type == "video":
-                print(f"  {i+1}. [video]  {item['video_url']}")
-            elif item_type == "image":
-                print(f"  {i+1}. [image]  {item['image_url']}")
-            elif item_type == "animated_image":
-                print(f"  {i+1}. [animated]")
-                print(f"     image: {item.get('image_url', '')}")
-                print(f"     video: {item.get('video_url', '')}")
+        if result:
+            print("\n" + "=" * 50)
+            print(f"Title:  {result.get('title', '')}")
+            print(f"Author: {result.get('author', '')}")
+            print(f"Type:   {result.get('type', '')}")
+            print(f"Cover:  {result.get('cover', '')}")
+            print(f"Items ({len(result.get('items', []))}):\n")
+            for i, item in enumerate(result.get("items", [])):
+                item_type = item["type"]
+                if item_type == "video":
+                    print(f"  {i+1}. [video]  {item['video_url']}")
+                elif item_type == "image":
+                    print(f"  {i+1}. [image]  {item['image_url']}")
+                elif item_type == "animated_image":
+                    print(f"  {i+1}. [animated]")
+                    print(f"     image: {item.get('image_url', '')}")
+                    print(f"     video: {item.get('video_url', '')}")
 
-        # Also print full JSON for programmatic consumption
-        print("\n" + "=" * 50)
-        print("JSON output:")
-        api_response = {
-            "code": 0,
-            "message": "success",
-            "data": result,
-        }
-        print(json.dumps(api_response, ensure_ascii=False, indent=2))
-    else:
-        print("\nFailed to extract media.")
+            # Also print full JSON for programmatic consumption
+            print("\n" + "=" * 50)
+            print("JSON output:")
+            api_response = {
+                "code": 0,
+                "message": "success",
+                "data": result,
+            }
+            print(json.dumps(api_response, ensure_ascii=False, indent=2))
+        else:
+            print("\nFailed to extract media.")
+    finally:
+        BrowserPool.shutdown()

@@ -3,7 +3,7 @@ Douyin Media Extractor API Server
 Provides HTTP API for extracting media URLs from Douyin pages.
 
 Usage:
-    python douyin_api.py
+    python douyin_phaser_api.py
     # Server runs on http://localhost:8000
 
 API:
@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from douyin_phaser import get_douyin_media
+from douyin_phaser import get_douyin_media, BrowserPool
 
 app = FastAPI(
     title="Douyin Media Extractor API",
@@ -32,6 +32,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    """Clean up persistent browser on server shutdown."""
+    BrowserPool.shutdown()
 
 
 def _error_response(code: int, message: str):
