@@ -7,7 +7,7 @@ Usage:
     # Server runs on http://localhost:8000
 
 API:
-    GET /api/extract?url=<douyin_url>
+    GET /?url=<douyin_url>
 """
 
 import asyncio
@@ -83,4 +83,4 @@ async def root(url: str = Query(None, description="Douyin share URL or page URL"
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
