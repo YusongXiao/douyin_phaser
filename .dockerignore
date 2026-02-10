@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+.venv
+.git
+.gitignore
+README.md
+原理.md
