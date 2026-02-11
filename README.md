@@ -19,7 +19,24 @@
 
 ## 🚀 快速开始
 
-### 1. 安装依赖
+### 方式一：Docker 部署 (推荐)
+
+无需安装 Python 环境，直接拉取并运行镜像：
+
+```bash
+# 拉取镜像
+docker pull ghcr.io/yusongxiao/douyin_phaser:main
+
+# 或者使用镜像仓库
+docker pull ccr.ccs.tencentyun.com/songhappy/douyin_phaser
+
+# 启动服务 (映射端口 8000)
+docker run -d -p 8000:8000 --name douyin-phaser ghcr.io/yusongxiao/douyin_phaser:main
+```
+
+### 方式二：源码部署
+
+#### 1. 安装依赖
 
 需要 Python 3.8+ 环境。
 
@@ -31,7 +48,7 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. 启动 API 服务 (推荐)
+#### 2. 启动 API 服务
 
 启动 API 服务器，供其他程序调用：
 
@@ -50,7 +67,7 @@ curl "http://localhost:8000/?url=https://v.douyin.com/abc1234/"
 **API 文档**:
 浏览器访问 `http://localhost:8000/docs` 查看完整的交互式 API 文档。
 
-### 3. 命令行使用 (CLI)
+#### 3. 命令行使用 (CLI)
 
 也可以直接运行脚本提取单个链接：
 
