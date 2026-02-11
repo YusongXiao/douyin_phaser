@@ -94,21 +94,24 @@ def extract_videos_from_dom(page):
     
     videos = page.query_selector_all('video')
     for video in videos:
+        # Check video src attribute directly
+        src = video.get_attribute('src')
+        if src and 'douyinvod' in src:
+            video_sources.append(src)
+        # Check source child elements
         sources = video.query_selector_all('source')
         for source in sources:
             src = source.get_attribute('src')
             if src and 'douyinvod' in src:
                 video_sources.append(src)
     
-    # Group by video content (URLs ending in same path pattern)
-    # and prefer v3-web domain for each unique video
+    # Group by video content and prefer v3-web domain for each unique video
     seen_videos = set()
     unique_videos = []
     
     for url in video_sources:
-        # Extract video identifier from URL path
-        # Pattern: /video/tos/cn/tos-cn-ve-15/XXXXX/?
-        match = re.search(r'/video/tos/cn/tos-cn-ve-15/([^/]+)/', url)
+        # Extract video identifier from URL path (flexible CDN bucket pattern)
+        match = re.search(r'/video/tos/cn/[^/]+/([^/?]+)', url)
         if match:
             video_id = match.group(1)
             if video_id not in seen_videos:
@@ -119,6 +122,12 @@ def extract_videos_from_dom(page):
                 elif not any('v3-web.douyinvod' in v and video_id in v for v in video_sources):
                     # No v3-web version available, use this one
                     unique_videos.append(url)
+        else:
+            # Fallback: use full URL path for deduplication
+            parsed_path = urlparse(url).path
+            if parsed_path not in seen_videos:
+                seen_videos.add(parsed_path)
+                unique_videos.append(url)
     
     return unique_videos
 
@@ -757,20 +766,63 @@ def _extract_video_fast(nav_url, content_id):
 
 
 def _extract_note(nav_url, content_id):
-    """Extract note/image content. Uses isolated context since DOM access may be needed."""
+    """Extract note/image content.
+
+    Strategy (mirrors the video fast-path):
+    1. Use the warm page (pre-established cookies) to call the detail API directly.
+    2. If that fails, navigate in an isolated context, wait for JS to set cookies,
+       then retry the API call.
+    3. Last resort: extract from the rendered DOM.
+    """
+
+    # ---- Fast path: API call via warm page (has cookies from earlier navigation) ----
+    did_navigate = BrowserPool.ensure_warmed(nav_url)
+    warm_page = BrowserPool.get_warm_page()
+
+    if did_navigate:
+        print(f"Navigating to {nav_url}...")
+        print(f"Final URL: {warm_page.url}")
+
+    print("\n[Note] Detected image/note page, extracting content...")
+    print(f"[Fast] Calling detail API for note {content_id}...")
+
+    api_result = extract_note_from_api(warm_page, content_id)
+    if api_result and api_result.get("items"):
+        meta = api_result["metadata"]
+        items = api_result["items"]
+        item_types = [it["type"] for it in items]
+        animated_count = item_types.count("animated_image")
+        image_count = item_types.count("image")
+        print(f"Successfully extracted {animated_count} animated + {image_count} static images via fast API call.")
+        return {
+            "title": meta.get("title", ""),
+            "author": meta.get("author", ""),
+            "author_id": meta.get("author_id", ""),
+            "cover": meta.get("cover", ""),
+            "type": "images",
+            "items": items,
+        }
+
+    # ---- Fallback: full navigation in an isolated context ----
+    print("  Fast API returned empty, falling back to full navigation...")
     context, page = BrowserPool.new_context_page()
     try:
         print(f"Navigating to {nav_url}...")
         page.goto(nav_url, wait_until="domcontentloaded", timeout=30000)
+        # Give JS time to initialize cookies/session before calling the API
+        page.wait_for_timeout(3000)
         print(f"Final URL: {page.url}")
-        print("\n[Note] Detected image/note page, extracting content...")
 
         api_result = extract_note_from_api(page, content_id)
 
         if api_result and api_result.get("items"):
             meta = api_result["metadata"]
             items = api_result["items"]
-            result = {
+            item_types = [it["type"] for it in items]
+            animated_count = item_types.count("animated_image")
+            image_count = item_types.count("image")
+            print(f"Successfully extracted {animated_count} animated + {image_count} static images via API.")
+            return {
                 "title": meta.get("title", ""),
                 "author": meta.get("author", ""),
                 "author_id": meta.get("author_id", ""),
@@ -778,16 +830,15 @@ def _extract_note(nav_url, content_id):
                 "type": "images",
                 "items": items,
             }
-            item_types = [it["type"] for it in items]
-            animated_count = item_types.count("animated_image")
-            image_count = item_types.count("image")
-            print(f"Successfully extracted {animated_count} animated + {image_count} static images via API.")
-            return result
         else:
-            # Fallback to DOM extraction
+            # Last resort: DOM extraction
             print("API extraction failed, falling back to DOM...")
             try:
-                page.wait_for_selector('img[src*="douyinpic"], [style*="background-image"]', timeout=5000)
+                page.wait_for_selector(
+                    'img[src*="douyinpic"], [style*="background-image"], '
+                    'video source[src*="douyinvod"], video[src*="douyinvod"]',
+                    timeout=8000,
+                )
             except Exception:
                 pass
 
@@ -808,7 +859,8 @@ def _extract_note(nav_url, content_id):
                     items.append({"type": "image", "image_url": img_url})
 
             if items:
-                result = {
+                print(f"Successfully extracted {len(items)} items from DOM.")
+                return {
                     "title": "",
                     "author": "",
                     "author_id": "",
@@ -816,8 +868,6 @@ def _extract_note(nav_url, content_id):
                     "type": "images",
                     "items": items,
                 }
-                print(f"Successfully extracted {len(items)} items from DOM.")
-                return result
             else:
                 print("Failed to extract content.")
                 return None
