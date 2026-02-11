@@ -335,17 +335,20 @@ def extract_video_from_api(page, found_data):
 # ---------------------------------------------------------------------------
 
 class BrowserPool:
-    """Maintains a persistent browser instance to avoid cold-start per request."""
+    """Maintains a persistent browser + warm page to avoid cold-start per request."""
     _playwright = None
     _browser = None
+    _warm_context = None
+    _warm_page = None
+    _warmed = False
     _lock = None
 
     @classmethod
     def _get_lock(cls):
-        """Lazy-init a lock (avoids import-time threading dependency)."""
+        """Lazy-init a reentrant lock (avoids import-time threading dependency)."""
         if cls._lock is None:
             import threading
-            cls._lock = threading.Lock()
+            cls._lock = threading.RLock()
         return cls._lock
 
     @classmethod
@@ -355,7 +358,6 @@ class BrowserPool:
             return cls._playwright, cls._browser
 
         with cls._get_lock():
-            # Double check inside lock
             if cls._browser and cls._browser.is_connected():
                 return cls._playwright, cls._browser
 
@@ -376,9 +378,88 @@ class BrowserPool:
             return cls._playwright, cls._browser
 
     @classmethod
-    def shutdown(cls):
-        """Clean up browser and Playwright resources."""
+    def get_warm_page(cls):
+        """Return a warm page with valid cookies for direct API calls.
+
+        On first call, navigates to douyin.com to establish cookies/session.
+        Subsequent calls return the same page instantly.
+        """
+        if cls._warm_page and not cls._warm_page.is_closed():
+            return cls._warm_page
+
         with cls._get_lock():
+            if cls._warm_page and not cls._warm_page.is_closed():
+                return cls._warm_page
+
+            _, browser = cls.get_browser()
+            cls._warm_context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 720},
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+            cls._warm_page = cls._warm_context.new_page()
+
+            if HAS_STEALTH:
+                _stealth.apply_stealth_sync(cls._warm_page)
+
+            cls._warm_page.route("**/*", _block_unnecessary)
+            cls._warmed = False
+            return cls._warm_page
+
+    @classmethod
+    def ensure_warmed(cls, nav_url):
+        """Warm up cookies by navigating to a Douyin page (first time only).
+
+        Returns True if a full navigation was performed (caller can try
+        intercepting the response), False if already warmed.
+        """
+        if cls._warmed:
+            return False
+        with cls._get_lock():
+            if cls._warmed:
+                return False
+            page = cls.get_warm_page()
+            print(f"[BrowserPool] Warming up with {nav_url}...")
+            page.goto(nav_url, wait_until="commit", timeout=30000)
+            # Wait briefly for cookies/JS to initialize
+            page.wait_for_timeout(2000)
+            cls._warmed = True
+            return True
+
+    @classmethod
+    def new_context_page(cls):
+        """Create an isolated context + page for full navigation (note pages, fallback)."""
+        _, browser = cls.get_browser()
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+        )
+        page = context.new_page()
+        if HAS_STEALTH:
+            _stealth.apply_stealth_sync(page)
+        page.route("**/*", _block_unnecessary)
+        return context, page
+
+    @classmethod
+    def shutdown(cls):
+        """Clean up all resources."""
+        with cls._get_lock():
+            if cls._warm_page:
+                try:
+                    cls._warm_page.close()
+                except Exception:
+                    pass
+                cls._warm_page = None
+            if cls._warm_context:
+                try:
+                    cls._warm_context.close()
+                except Exception:
+                    pass
+                cls._warm_context = None
+            cls._warmed = False
             if cls._browser:
                 try:
                     cls._browser.close()
@@ -399,7 +480,14 @@ class BrowserPool:
 # ---------------------------------------------------------------------------
 
 _BLOCKED_RESOURCE_TYPES = {"image", "font", "stylesheet", "media", "websocket", "manifest", "texttrack", "eventsource", "ping"}
-_BLOCKED_URL_KEYWORDS = ["analytics", "log-sdk", "sentry", "monitor", "beacon", "performance", "frontier/collect"]
+_BLOCKED_URL_KEYWORDS = [
+    "analytics", "log-sdk", "sentry", "monitor", "beacon",
+    "performance", "frontier/collect", "secsdk", "captcha",
+    "search/list", "hot/search", "notification",
+    "user/settings", "risklevel", "online_feedback",
+    "solution/resource", "turn/offline", "social/count",
+    "seo/inner/link", "query/user",
+]
 
 def _block_unnecessary(route, request):
     """Abort requests for resources we don't need."""
@@ -546,6 +634,9 @@ def get_douyin_media(url):
     Extracts media URLs from a Douyin page.
     Supports both video pages and note/image pages.
 
+    Uses a fast-path for videos: direct API call via persistent warm page.
+    Falls back to full page navigation if the fast-path fails.
+
     Returns:
         dict matching the API response schema, or None on failure.
     """
@@ -577,183 +668,227 @@ def get_douyin_media(url):
         content_id = note_match.group(1)
         content_type = 'note'
 
-    _, browser = BrowserPool.get_browser()
-    context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        viewport={"width": 1280, "height": 720},
-        locale="zh-CN",
-        timezone_id="Asia/Shanghai",
-    )
-    page = context.new_page()
-
-    # Apply stealth to bypass anti-bot detection (critical for Linux headless)
-    if HAS_STEALTH:
-        _stealth.apply_stealth_sync(page)
-
-    page.route("**/*", _block_unnecessary)
-
     try:
         if content_type == 'video':
-            # --- Video page: use expect_response for fast API interception ---
-            print(f"Navigating to {nav_url}...")
-            try:
-                with page.expect_response(
-                    lambda r: "aweme/v1/web/aweme/detail" in r.url and r.status == 200,
-                    timeout=15000
-                ) as resp_info:
-                    page.goto(nav_url, wait_until="commit", timeout=30000)
-
-                api_resp = resp_info.value
-                json_data = api_resp.json()
-                print(f"Final URL: {page.url}")
-
-                if "aweme_detail" in json_data:
-                    result = _parse_video_detail(json_data["aweme_detail"])
-                    if result:
-                        print("Successfully extracted video URL.")
-            except Exception as e:
-                print(f"  Response interception timed out: {e}")
-
-            # Fallback: direct API call if interception failed
-            if not result and content_id:
-                print("  Trying direct API call...")
-                detail = _call_detail_api(page, content_id)
-                if detail:
-                    result = _parse_video_detail(detail)
-                    if result:
-                        print("Successfully extracted video URL via direct API.")
-
-            if not result:
-                print("Failed to extract video URL.")
-
+            result = _extract_video_fast(nav_url, content_id)
         elif content_type == 'note':
-            # --- Note/Image page ---
-            print(f"Navigating to {nav_url}...")
-            page.goto(nav_url, wait_until="domcontentloaded", timeout=30000)
+            result = _extract_note(nav_url, content_id)
+        else:
+            # Unknown type — use full navigation to determine
+            result = _extract_unknown(nav_url)
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        elapsed = time.time() - start_ts
+        print(f"[Perf] Request completed in {elapsed:.2f}s")
+
+    return result
+
+
+def _extract_video_fast(nav_url, content_id):
+    """Fast-path video extraction: direct API call via warm page.
+
+    Strategy:
+    1. Ensure warm page has cookies (first request does full navigation)
+    2. Call detail API directly via fetch() — no page navigation needed
+    3. Fall back to full navigation + response interception if API returns empty
+    """
+    # Ensure we have a warm page with cookies
+    did_navigate = BrowserPool.ensure_warmed(nav_url)
+    warm_page = BrowserPool.get_warm_page()
+
+    if did_navigate:
+        # First request — we just navigated, try to parse the page's API response
+        # via direct API call (cookies are now set)
+        print(f"Navigating to {nav_url}...")
+        print(f"Final URL: {warm_page.url}")
+
+    # Fast path: direct API call using warm page with cookies
+    print(f"[Fast] Calling detail API for {content_id}...")
+    detail = _call_detail_api(warm_page, content_id)
+    if detail:
+        result = _parse_video_detail(detail)
+        if result:
+            print("Successfully extracted video URL via fast API call.")
+            return result
+
+    # Fallback: full navigation with response interception
+    print("  Fast API returned empty, falling back to full navigation...")
+    context, page = BrowserPool.new_context_page()
+    try:
+        print(f"Navigating to {nav_url}...")
+        try:
+            with page.expect_response(
+                lambda r: "aweme/v1/web/aweme/detail" in r.url and r.status == 200,
+                timeout=15000
+            ) as resp_info:
+                page.goto(nav_url, wait_until="commit", timeout=30000)
+
+            api_resp = resp_info.value
+            json_data = api_resp.json()
             print(f"Final URL: {page.url}")
-            print("\n[Note] Detected image/note page, extracting content...")
 
-            api_result = extract_note_from_api(page, content_id)
+            if "aweme_detail" in json_data:
+                result = _parse_video_detail(json_data["aweme_detail"])
+                if result:
+                    print("Successfully extracted video URL via fallback navigation.")
+                    # Re-warm with this context's cookies
+                    return result
+        except Exception as e:
+            print(f"  Response interception timed out: {e}")
 
-            if api_result and api_result.get("items"):
-                meta = api_result["metadata"]
-                items = api_result["items"]
+        # Last resort: direct API in the navigated page
+        if content_id:
+            print("  Trying direct API in fallback page...")
+            detail = _call_detail_api(page, content_id)
+            if detail:
+                result = _parse_video_detail(detail)
+                if result:
+                    print("Successfully extracted video URL via fallback direct API.")
+                    return result
+
+        print("Failed to extract video URL.")
+        return None
+    finally:
+        context.close()
+
+
+def _extract_note(nav_url, content_id):
+    """Extract note/image content. Uses isolated context since DOM access may be needed."""
+    context, page = BrowserPool.new_context_page()
+    try:
+        print(f"Navigating to {nav_url}...")
+        page.goto(nav_url, wait_until="domcontentloaded", timeout=30000)
+        print(f"Final URL: {page.url}")
+        print("\n[Note] Detected image/note page, extracting content...")
+
+        api_result = extract_note_from_api(page, content_id)
+
+        if api_result and api_result.get("items"):
+            meta = api_result["metadata"]
+            items = api_result["items"]
+            result = {
+                "title": meta.get("title", ""),
+                "author": meta.get("author", ""),
+                "author_id": meta.get("author_id", ""),
+                "cover": meta.get("cover", ""),
+                "type": "images",
+                "items": items,
+            }
+            item_types = [it["type"] for it in items]
+            animated_count = item_types.count("animated_image")
+            image_count = item_types.count("image")
+            print(f"Successfully extracted {animated_count} animated + {image_count} static images via API.")
+            return result
+        else:
+            # Fallback to DOM extraction
+            print("API extraction failed, falling back to DOM...")
+            try:
+                page.wait_for_selector('img[src*="douyinpic"], [style*="background-image"]', timeout=5000)
+            except Exception:
+                pass
+
+            dom_images = extract_images_from_dom(page)
+            dom_videos = extract_videos_from_dom(page)
+
+            items = []
+            if dom_videos:
+                for i, vid_url in enumerate(dom_videos):
+                    item = {"type": "animated_image", "video_url": vid_url}
+                    if i < len(dom_images):
+                        item["image_url"] = dom_images[i]
+                    items.append(item)
+                for img_url in dom_images[len(dom_videos):]:
+                    items.append({"type": "image", "image_url": img_url})
+            else:
+                for img_url in dom_images:
+                    items.append({"type": "image", "image_url": img_url})
+
+            if items:
+                result = {
+                    "title": "",
+                    "author": "",
+                    "author_id": "",
+                    "cover": "",
+                    "type": "images",
+                    "items": items,
+                }
+                print(f"Successfully extracted {len(items)} items from DOM.")
+                return result
+            else:
+                print("Failed to extract content.")
+                return None
+    finally:
+        context.close()
+
+
+def _extract_unknown(nav_url):
+    """Handle unknown URL type — navigate and determine from final URL."""
+    context, page = BrowserPool.new_context_page()
+    try:
+        print(f"Navigating to {nav_url}...")
+        found_data = {"url": None, "type": None, "cover_url": None, "metadata": None}
+        page.on("response", extract_video_from_api(page, found_data))
+        page.goto(nav_url, wait_until="domcontentloaded", timeout=30000)
+        final_url = page.url
+        print(f"Final URL: {final_url}")
+
+        if "/video/" in final_url:
+            for _ in range(10):
+                if found_data["url"]:
+                    break
+                page.wait_for_timeout(500)
+
+            if found_data["url"]:
+                meta = found_data.get("metadata") or {}
                 result = {
                     "title": meta.get("title", ""),
                     "author": meta.get("author", ""),
                     "author_id": meta.get("author_id", ""),
                     "cover": meta.get("cover", ""),
-                    "type": "images",
-                    "items": items,
+                    "type": "video",
+                    "items": [
+                        {
+                            "type": "video",
+                            "video_url": found_data["url"],
+                            "cover_url": found_data.get("cover_url", ""),
+                        }
+                    ],
                 }
-                item_types = [it["type"] for it in items]
-                animated_count = item_types.count("animated_image")
-                image_count = item_types.count("image")
-                print(f"Successfully extracted {animated_count} animated + {image_count} static images via API.")
+                print("Successfully extracted video URL.")
+                return result
             else:
-                # Fallback to DOM extraction
-                print("API extraction failed, falling back to DOM...")
-                try:
-                    page.wait_for_selector('img[src*="douyinpic"], [style*="background-image"]', timeout=5000)
-                except Exception:
-                    pass
+                vid_m = re.search(r'/video/(\d+)', final_url)
+                if vid_m:
+                    detail = _call_detail_api(page, vid_m.group(1))
+                    if detail:
+                        result = _parse_video_detail(detail)
+                        if result:
+                            print("Successfully extracted video URL via direct API.")
+                            return result
 
-                dom_images = extract_images_from_dom(page)
-                dom_videos = extract_videos_from_dom(page)
-
-                items = []
-                if dom_videos:
-                    for i, vid_url in enumerate(dom_videos):
-                        item = {"type": "animated_image", "video_url": vid_url}
-                        if i < len(dom_images):
-                            item["image_url"] = dom_images[i]
-                        items.append(item)
-                    for img_url in dom_images[len(dom_videos):]:
-                        items.append({"type": "image", "image_url": img_url})
-                else:
-                    for img_url in dom_images:
-                        items.append({"type": "image", "image_url": img_url})
-
-                if items:
-                    result = {
-                        "title": "",
-                        "author": "",
-                        "author_id": "",
-                        "cover": "",
-                        "type": "images",
-                        "items": items,
-                    }
-                    print(f"Successfully extracted {len(items)} items from DOM.")
-                else:
-                    print("Failed to extract content.")
-
-        else:
-            # --- Unknown type: navigate and determine from final URL ---
-            print(f"Navigating to {nav_url}...")
-            found_data = {"url": None, "type": None, "cover_url": None, "metadata": None}
-            page.on("response", extract_video_from_api(page, found_data))
-            page.goto(nav_url, wait_until="domcontentloaded", timeout=30000)
-            final_url = page.url
-            print(f"Final URL: {final_url}")
-
-            if "/video/" in final_url:
-                for _ in range(10):
-                    if found_data["url"]:
-                        break
-                    page.wait_for_timeout(500)
-
-                if found_data["url"]:
-                    meta = found_data.get("metadata") or {}
+        elif "/note/" in final_url:
+            note_m = re.search(r'/note/(\d+)', final_url)
+            if note_m:
+                api_result = extract_note_from_api(page, note_m.group(1))
+                if api_result and api_result.get("items"):
+                    meta = api_result["metadata"]
                     result = {
                         "title": meta.get("title", ""),
                         "author": meta.get("author", ""),
                         "author_id": meta.get("author_id", ""),
                         "cover": meta.get("cover", ""),
-                        "type": "video",
-                        "items": [
-                            {
-                                "type": "video",
-                                "video_url": found_data["url"],
-                                "cover_url": found_data.get("cover_url", ""),
-                            }
-                        ],
+                        "type": "images",
+                        "items": api_result["items"],
                     }
-                    print("Successfully extracted video URL.")
-                else:
-                    vid_m = re.search(r'/video/(\d+)', final_url)
-                    if vid_m:
-                        detail = _call_detail_api(page, vid_m.group(1))
-                        if detail:
-                            result = _parse_video_detail(detail)
-                            if result:
-                                print("Successfully extracted video URL via direct API.")
+                    print("Successfully extracted content via API.")
+                    return result
+        else:
+            print(f"Unknown page type: {final_url}")
 
-            elif "/note/" in final_url:
-                note_m = re.search(r'/note/(\d+)', final_url)
-                if note_m:
-                    api_result = extract_note_from_api(page, note_m.group(1))
-                    if api_result and api_result.get("items"):
-                        meta = api_result["metadata"]
-                        result = {
-                            "title": meta.get("title", ""),
-                            "author": meta.get("author", ""),
-                            "author_id": meta.get("author_id", ""),
-                            "cover": meta.get("cover", ""),
-                            "type": "images",
-                            "items": api_result["items"],
-                        }
-                        print("Successfully extracted content via API.")
-            else:
-                print(f"Unknown page type: {final_url}")
-
-    except Exception as e:
-        print(f"Error: {e}")
+        return None
     finally:
         context.close()
-        elapsed = time.time() - start_ts
-        print(f"[Perf] Request completed in {elapsed:.2f}s")
-
-    return result
 
 
 if __name__ == "__main__":
