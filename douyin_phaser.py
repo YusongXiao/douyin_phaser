@@ -526,10 +526,13 @@ def _resolve_short_url(url):
         # e.g. https://www.iesdouyin.com/share/video/7600310201732179264/?...
         vid_match = re.search(r'/video/(\d+)', location)
         note_match = re.search(r'/note/(\d+)', location)
+        slides_match = re.search(r'/slides/(\d+)', location)
         if vid_match:
             return f"https://www.douyin.com/video/{vid_match.group(1)}"
         elif note_match:
             return f"https://www.douyin.com/note/{note_match.group(1)}"
+        elif slides_match:
+            return f"https://www.douyin.com/note/{slides_match.group(1)}"
     except Exception:
         pass
     return url
