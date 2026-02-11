@@ -12,6 +12,17 @@ import http.client
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+try:
+    from playwright_stealth import Stealth
+    _stealth = Stealth(
+        navigator_platform_override="Win32",
+        navigator_languages_override=("zh-CN", "zh"),
+    )
+    HAS_STEALTH = True
+except ImportError:
+    _stealth = None
+    HAS_STEALTH = False
+
 def extract_images_from_dom(page):
     """
     Extract image URLs directly from DOM for note/image pages.
@@ -350,7 +361,17 @@ class BrowserPool:
 
             from playwright.sync_api import sync_playwright
             cls._playwright = sync_playwright().start()
-            cls._browser = cls._playwright.chromium.launch(headless=True)
+            cls._browser = cls._playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-infobars",
+                    "--disable-background-networking",
+                    "--disable-gpu",
+                ],
+            )
             print("[BrowserPool] Chromium launched.")
             return cls._playwright, cls._browser
 
@@ -558,10 +579,17 @@ def get_douyin_media(url):
 
     _, browser = BrowserPool.get_browser()
     context = browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        viewport={"width": 1280, "height": 720}
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        viewport={"width": 1280, "height": 720},
+        locale="zh-CN",
+        timezone_id="Asia/Shanghai",
     )
     page = context.new_page()
+
+    # Apply stealth to bypass anti-bot detection (critical for Linux headless)
+    if HAS_STEALTH:
+        _stealth.apply_stealth_sync(page)
+
     page.route("**/*", _block_unnecessary)
 
     try:
