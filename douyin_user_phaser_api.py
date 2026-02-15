@@ -99,6 +99,10 @@ async def root(
         if "/user/" not in url:
             return _error_response(400, "URL must be a Douyin user profile URL containing /user/")
 
+        # Default to douyin_cookies.json if not specified (for Docker/host usage)
+        if not cookie:
+            cookie = "douyin_cookies.json"
+
         cookies = _get_cookies(cookie)
 
         try:
@@ -118,7 +122,7 @@ async def root(
         "params": {
             "url": "Douyin user profile URL (required)",
             "max": "Maximum number of works to fetch (optional)",
-            "cookie": "Cookie string or path to cookie file (optional, use --login exported JSON for full auth)",
+            "cookie": "Cookie string or path to cookie file (optional, defaults to douyin_cookies.json)",
         },
         "docs": "/docs",
         "tip": "Run `python douyin_user_phaser.py --login` first to export cookies with HttpOnly auth tokens.",

@@ -19,7 +19,16 @@
 
 ## 🚀 快速开始
 
-### 方式一：Docker Compose 部署 (推荐)
+### 方式一：Docker 快速部署 (仅媒体提取)
+
+如果你只需要提取**单个视频/图文**的直链，无需任何配置，直接运行即可（不需要 Cookie）：
+
+```bash
+docker run -d -p 8000:8000 --name douyin-phaser ghcr.io/yusongxiao/douyin_phaser:main
+```
+服务启动后，访问 `http://localhost:8000` 即可使用。
+
+### 方式二：Docker Compose 部署 (推荐 - 完整功能)
 
 这种方式可以同时启动媒体提取 API (8000) 和用户主页提取 API (8001)，并且支持持久化 Cookie。
 
@@ -50,7 +59,7 @@
      sh -c "uvicorn douyin_phaser_api:app --host 0.0.0.0 --port 8000 & uvicorn douyin_user_phaser_api:app --host 0.0.0.0 --port 8001 & wait"
    ```
 
-### 方式二：源码部署
+### 方式三：源码部署
 
 #### 1. 安装依赖
 
