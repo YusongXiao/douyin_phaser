@@ -19,20 +19,36 @@
 
 ## 🚀 快速开始
 
-### 方式一：Docker 部署 (推荐)
+### 方式一：Docker Compose 部署 (推荐)
 
-无需安装 Python 环境，直接拉取并运行镜像：
+这种方式可以同时启动媒体提取 API (8000) 和用户主页提取 API (8001)，并且支持持久化 Cookie。
 
-```bash
-# 拉取镜像
-docker pull ghcr.io/yusongxiao/douyin_phaser:main
+1. **生成 Cookie (必须)**
+   
+   由于容器内无法扫码登录，你需要先在宿主机生成 Cookie 文件：
+   ```bash
+   # 在项目目录下运行，会弹出浏览器让你扫码
+   python douyin_user_phaser.py --login
+   # 成功后会生成 douyin_cookies.json 文件
+   ```
 
-# 或者使用镜像仓库
-docker pull ccr.ccs.tencentyun.com/songhappy/douyin_phaser
+2. **启动服务**
 
-# 启动服务 (映射端口 8000)
-docker run -d -p 8000:8000 --name douyin-phaser ghcr.io/yusongxiao/douyin_phaser:main
-```
+   使用 Docker Compose 一键启动：
+   ```bash
+   docker compose up -d
+   ```
+
+   或者使用 Docker 命令直接运行 (如果你没有安装 Compose)：
+   ```bash
+   docker run -d \
+     -p 8000:8000 \
+     -p 8001:8001 \
+     -v ${PWD}/douyin_cookies.json:/app/douyin_cookies.json \
+     --name douyin-phaser \
+     ghcr.io/yusongxiao/douyin_phaser:main \
+     sh -c "uvicorn douyin_phaser_api:app --host 0.0.0.0 --port 8000 & uvicorn douyin_user_phaser_api:app --host 0.0.0.0 --port 8001 & wait"
+   ```
 
 ### 方式二：源码部署
 
@@ -60,12 +76,15 @@ python douyin_phaser_api.py
 **API 使用示例**:
 
 ```bash
-# 提取视频/图文直链
+# 提取视频/图文直链 (媒体提取 API)
 curl "http://localhost:8000/?url=https://v.douyin.com/abc1234/"
+
+# 提取用户主页所有作品 (用户提取 API)
+curl "http://localhost:8001/?url=https://www.douyin.com/user/..."
 ```
 
 **API 文档**:
-浏览器访问 `http://localhost:8000/docs` 查看完整的交互式 API 文档。
+浏览器访问 `http://localhost:8000/docs` (媒体提取) 或 `http://localhost:8001/docs` (用户提取) 查看完整的交互式 API 文档。
 
 #### 3. 命令行使用 (CLI)
 
