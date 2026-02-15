@@ -105,7 +105,11 @@ python douyin_phaser.py "https://v.douyin.com/abc1234/"
 
 ## 🛠️ API 返回结构
 
-API 返回统一的 JSON 结构，极大简化了调用方的处理逻辑：
+API 返回统一的 JSON 结构，方便调用方处理。
+
+### 1. 媒体提取 API (端口 8000)
+
+用于提取单个视频、图文或动图的直链。
 
 ```json
 {
@@ -131,6 +135,44 @@ API 返回统一的 JSON 结构，极大简化了调用方的处理逻辑：
         "type": "animated_image",
         "image_url": "https://...webp",
         "video_url": "https://...mp4"
+      }
+    ]
+  }
+}
+```
+
+### 2. 用户主页提取 API (端口 8001)
+
+用于提取用户主页的所有作品链接。
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "user": {
+      "nickname": "用户昵称",
+      "sec_uid": "MS4wLjABAAAA...",
+      "uid": "123456789",
+      "avatar": "https://...",
+      "signature": "用户签名",
+      "aweme_count": 8
+    },
+    "works_count": 30,
+    "works": [
+      {
+        "aweme_id": "7606955181091438309",
+        "type": "note",
+        "desc": "作品描述",
+        "share_url": "https://www.douyin.com/note/7606955181091438309",
+        "create_time": 1771132277
+      },
+      {
+        "aweme_id": "7599252551926900837",
+        "type": "video",
+        "desc": "作品描述",
+        "share_url": "https://www.douyin.com/video/7599252551926900837",
+        "create_time": 1769338866
       }
     ]
   }
